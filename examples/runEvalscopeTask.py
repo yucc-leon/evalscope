@@ -21,8 +21,7 @@ basic_math_task_cfg = TaskConfig(
         'max_tokens': 512,
         'temperature': 0.0,
         'n': 1
-    },
-    dp=1,
+    }
 )
 
 hard_math_task_cfg = TaskConfig(
@@ -43,8 +42,7 @@ hard_math_task_cfg = TaskConfig(
         'max_tokens': 4096,
         'temperature': 0.6,
         'n': 8
-    },
-    dp=1,
+    }
 )
 run_task(task_cfg=basic_math_task_cfg)
 run_task(task_cfg=hard_math_task_cfg)
