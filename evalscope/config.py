@@ -123,7 +123,14 @@ class TaskConfig(BaseArgument):
     """Additional arguments for the judge model configuration."""
 
     analysis_report: bool = False
-    """Whether to generate detailed analysis reports after evaluation."""
+    """Whether to generate detailed analysis reports after evaluation.""" 
+
+    # Data parallel across GPUs
+    dp: int = 1
+    """Data-parallel world size. If >1, spawn dp processes, each bound to a GPU."""
+
+    dp_rank: Optional[int] = None
+    """Rank of this process in data-parallel execution. Set internally when spawning."""
 
     # Sandbox configuration arguments
     use_sandbox: bool = False

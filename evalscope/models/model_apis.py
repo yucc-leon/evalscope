@@ -17,6 +17,11 @@ def openai_api() -> type[ModelAPI]:
 
     return OpenAICompatibleAPI
 
+@register_model_api(name='vllm_openai')
+def vllm_openai() -> type[ModelAPI]:
+    from .vllm_openai import VllmOpenAIAPI
+    
+    return VllmOpenAIAPI
 
 @register_model_api(name='server')
 @deprecated(since='1.0.0', remove_in='1.1.0', alternative='openai_api')
