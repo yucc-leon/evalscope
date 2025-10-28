@@ -12,6 +12,7 @@ else:
             'openai_api',
             'mockllm',
             'llm_ckpt',
+            'vllm_openai'
         ]
     }
 

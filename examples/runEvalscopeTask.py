@@ -4,11 +4,25 @@ from evalscope.constants import EvalType
 
 # basic_math_names = ['gsm8k','competition_math','cmmlu','ceval']
 
+# Tip: To use the local vLLM SDK instead of a service, set
+#   eval_type='vllm_openai' and point `model` to a local path or model ID.
+#   Remove `api_url` and `api_key`. Multiprocessing DP can follow examples/test_chat.py
+#   by spawning N processes and setting CUDA_VISIBLE_DEVICES per process.
+# Example:
+# sdk_task_cfg = TaskConfig(
+#     model='Qwen/Qwen2.5-0.5B-Instruct',
+#     eval_type='vllm_openai',
+#     datasets=['cmmlu'],
+#     eval_batch_size=1,
+#     generation_config={'max_tokens': 512, 'temperature': 0.0, 'top_p': 0.9},
+# )
+# run_task(task_cfg=sdk_task_cfg)
+
 basic_math_task_cfg = TaskConfig(
     model='zm60b',
     api_url='http://127.0.0.1:8801/v1',
     api_key='EMPTY',
-    eval_type=EvalType.SERVICE,
+    eval_type=EvalType.VLLMOPENAI,
     datasets=['competition_math','cmmlu','ceval'],
     dataset_args={
         # 'gsm8k': {'few_shot_num': 0},
@@ -28,7 +42,7 @@ hard_math_task_cfg = TaskConfig(
     model='zm60b',
     api_url='http://127.0.0.1:8801/v1',
     api_key='EMPTY',
-    eval_type=EvalType.SERVICE,
+    eval_type=EvalType.VLLMOPENAI,
     datasets=['math_500','aime24','aime25','amc','minerva_math'],
     dataset_args={
         'math_500': {'few_shot_num': 0, },

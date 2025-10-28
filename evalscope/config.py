@@ -86,6 +86,9 @@ class TaskConfig(BaseArgument):
 
     rerun_review: bool = False
     """Whether to rerun the review process even if results exist."""
+    
+    model_alias: Optional[str] = None
+    """Results should be saved in this folder"""
 
     work_dir: str = DEFAULT_WORK_DIR
     """Working directory for storing evaluation results and temporary files."""

@@ -184,7 +184,22 @@ class DefaultEvaluator(Evaluator):
             }
 
             # Process completed tasks with progress bar
-            with tqdm(total=len(dataset_list), desc=f'Predicting[{self.benchmark_name}@{subset}]: ') as pbar:
+            # Position/disable can be controlled via environment for multi-process runs
+            pos_env = os.environ.get('EVALSCOPE_TQDM_POSITION', None)
+            try:
+                position = int(pos_env) if pos_env is not None else 0
+            except Exception:
+                position = 0
+            disable = str(os.environ.get('EVALSCOPE_TQDM_DISABLE', '0')).lower() in ('1', 'true', 'yes')
+
+            with tqdm(
+                total=len(dataset_list),
+                desc=f'Predicting[{self.benchmark_name}@{subset}]: ',
+                position=position,
+                leave=False,
+                dynamic_ncols=True,
+                disable=disable,
+            ) as pbar:
                 for future in as_completed(future_to_sample):
                     sample = future_to_sample[future]
                     try:
@@ -196,6 +211,17 @@ class DefaultEvaluator(Evaluator):
                             subset, task_state, self.benchmark.save_metadata
                         )
                         logger.debug(f'Model result: \n{model_result.pretty_print()}')
+
+                        # update tqdm postfix with perf if available
+                        perf = (task_state.metadata or {}).get('perf', {})
+                        tok_ps = perf.get('tok_per_s', None)
+                        ch_ps = perf.get('chars_per_s', None)
+                        time_s = perf.get('time_s', None)
+                        pbar.set_postfix({
+                            'time_s': f"{time_s:.3f}" if isinstance(time_s, (int, float)) else '-',
+                            'tok/s': f"{tok_ps:.1f}" if isinstance(tok_ps, (int, float)) else '-',
+                            'chars/s': f"{ch_ps:.1f}" if isinstance(ch_ps, (int, float)) else '-',
+                        }, refresh=False)
 
                     except Exception as exc:
                         tb_str = traceback.format_exc()
@@ -224,8 +250,38 @@ class DefaultEvaluator(Evaluator):
         """
         logger.debug(f'\n{sample.pretty_print()}')
 
-        # Run model inference on the current sample
+        # Run model inference on the current sample with simple perf timing
+        import time
+        t0 = time.time()
         task_state = self.benchmark.run_inference(model=self.model, sample=sample, output_dir=model_prediction_dir)
+        t1 = time.time()
+
+        # Estimate throughput based on available usage or text length
+        try:
+            gen_time = max(1e-9, t1 - t0)
+            output_text = task_state.output.completion if task_state and task_state.output else ''
+            output_chars = len(output_text) if isinstance(output_text, str) else 0
+            output_tokens = None
+            if task_state and task_state.output and task_state.output.usage:
+                output_tokens = task_state.output.usage.output_tokens or None
+
+            tok_per_s = (float(output_tokens) / gen_time) if output_tokens is not None else None
+            chars_per_s = float(output_chars) / gen_time if output_chars else None
+
+            # attach perf to metadata
+            meta = task_state.metadata or {}
+            perf = {
+                'time_s': gen_time,
+                'output_tokens': output_tokens,
+                'output_chars': output_chars,
+                'tok_per_s': tok_per_s,
+                'chars_per_s': chars_per_s,
+            }
+            meta['perf'] = perf
+            task_state.metadata = meta
+        except Exception:
+            pass
+
         return task_state
 
     def get_reviews(self, subset: str, task_states: List[TaskState]) -> List[SampleScore]:
@@ -286,6 +342,8 @@ class DefaultEvaluator(Evaluator):
                             save_metadata=self.benchmark.save_metadata
                         )
                         logger.debug(f'Review result: \n{review_result.pretty_print()}')
+                        # Optional: update review bar with sample id
+                        pbar.set_postfix({'sample': task_state.sample_id}, refresh=False)
 
                     except Exception as exc:
                         tb_str = traceback.format_exc()

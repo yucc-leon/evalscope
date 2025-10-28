@@ -35,14 +35,46 @@ class VllmOpenAIAPI(ModelAPI):
         # lazy import after check
         from vllm import LLM  # type: ignore
 
-        # Initialize the engine following examples/test_chat.py pattern:
-        # - Let user control CUDA via environment (e.g., CUDA_VISIBLE_DEVICES)
-        # - Pass model path/id directly
-        # - Do not assume additional defaults that could break correctness
-        self.llm = LLM(
-            model=self.model_name,
-            **model_args
-        )
+        # Normalize and filter model_args to avoid unsupported keys
+        args: Dict[str, Any] = dict(model_args) if model_args else {}
+        # Map precision/torch_dtype to vLLM dtype
+        precision = args.pop('precision', None) or args.pop('torch_dtype', None)
+        if isinstance(precision, str):
+            p = precision.lower()
+            if 'float16' in p:
+                args['dtype'] = 'float16'
+            elif 'bfloat16' in p:
+                args['dtype'] = 'bfloat16'
+            elif 'float32' in p or 'fp32' in p:
+                args['dtype'] = 'float32'
+            elif 'auto' in p:
+                args['dtype'] = 'auto'
+        # Tokenizer path mapping
+        if 'tokenizer_path' in args:
+            args['tokenizer'] = args.pop('tokenizer_path')
+        # Drop known non-vLLM keys
+        for k in ['device_map', 'revision', 'chat_template', 'token', 'enable_thinking', 'tokenizer_call_args']:
+            args.pop(k, None)
+        # Whitelist commonly supported vLLM args
+        allowed = {
+            'tensor_parallel_size',
+            'pipeline_parallel_size',
+            'dtype',
+            'gpu_memory_utilization',
+            'enforce_eager',
+            'trust_remote_code',
+            'max_model_len',
+            'max_num_seqs',
+            'tokenizer',
+        }
+        args = {k: v for k, v in args.items() if k in allowed}
+
+        # Provide safe defaults
+        args.setdefault('dtype', 'auto')
+        args.setdefault('enforce_eager', True)
+
+        # Initialize the engine following examples/test_chat.py pattern
+        self.llm = LLM(model=self.model_name, **args)
 
     def generate(
         self,
