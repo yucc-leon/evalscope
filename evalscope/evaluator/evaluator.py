@@ -8,6 +8,7 @@ and report generation.
 """
 
 import os
+from threading import Lock
 import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
@@ -76,6 +77,8 @@ class DefaultEvaluator(Evaluator):
             model_name=self.model_name,
             benchmark_name=self.benchmark_name,
         )
+        # Track summed inference time per subset (from per-sample perf)
+        self._subset_infer_times: Dict[str, float] = {}
 
     def eval(self) -> Report:
         """
@@ -92,9 +95,11 @@ class DefaultEvaluator(Evaluator):
         """
         # Load the dataset and evaluate each subset
         logger.info(f'Start evaluating benchmark: {self.benchmark_name}')
+        import time
         dataset_dict = self.benchmark.load_dataset()
         agg_score_dict = defaultdict(list)
-
+        subset_wall_times: Dict[str, float] = {}
+        
         # Process each subset (e.g., test, validation) independently
         logger.info('Evaluating all subsets of the dataset...')
         for subset, dataset in dataset_dict.items():
@@ -102,16 +107,32 @@ class DefaultEvaluator(Evaluator):
                 logger.info(f'No samples found in subset: {subset}, skipping.')
                 continue
             logger.info(f'Evaluating subset: {subset}')
+            t0 = time.perf_counter()
             subset_score = self.evaluate_subset(subset, dataset)
+            t1 = time.perf_counter()
+            subset_wall_times[subset] = round(t1 - t0, 3)
             agg_score_dict[subset] = subset_score
 
         # Generate the report based on aggregated scores
         logger.info('Generating report...')
-        report = self.get_report(agg_score_dict)
+        t_report0 = time.perf_counter()
+        # Prefer true inference time from cached per-sample perf; fallback to wall time
+        subset_times = self._subset_infer_times if any(self._subset_infer_times.values()) else subset_wall_times
+        report = self.get_report(agg_score_dict, subset_times=subset_times)
+        t_report1 = time.perf_counter()
+        # Attach timing metadata to report and persist to disk
+        try:
+            report.elapsed_time_s = round(sum(subset_times.values()) + (t_report1 - t_report0), 3)
+            report.subset_times_s = subset_times
+            # Overwrite report JSON with timing included
+            report_file = self.cache_manager.get_report_file()
+            report.to_json(report_file)
+        except Exception:
+            pass
 
         # Finalize the evaluation process
         self.finalize()
-        logger.info(f'Benchmark {self.benchmark_name} evaluation finished.')
+        logger.info(f'Benchmark {self.benchmark_name} evaluation finished. Timing (s): {subset_times}')
         return report
 
     def evaluate_subset(self, subset: str, dataset: Dataset) -> List[AggScore]:
@@ -133,6 +154,17 @@ class DefaultEvaluator(Evaluator):
         # Get model predictions for all samples in the subset
         logger.info(f'Getting predictions for subset: {subset}')
         task_states = self.get_answers(subset, dataset)
+        # Sum per-sample inference time from metadata if available
+        try:
+            infer_time = 0.0
+            for ts in task_states:
+                perf = (ts.metadata or {}).get('perf', {}) if ts.metadata else {}
+                t = perf.get('time_s')
+                if isinstance(t, (int, float)) and t > 0:
+                    infer_time += float(t)
+            self._subset_infer_times[subset] = round(infer_time, 3)
+        except Exception:
+            pass
 
         # Calculate evaluation metrics for each prediction
         logger.info(f'Getting reviews for subset: {subset}')
@@ -175,6 +207,147 @@ class DefaultEvaluator(Evaluator):
             return task_state_list
 
         logger.info(f'Processing {len(dataset_list)} samples, if data is large, it may take a while.')
+
+        # Try optimized batch path if supported and batch_size > 1
+        try:
+            supports_batch = getattr(self.model.api, 'supports_batch', lambda: False)()
+        except Exception:
+            supports_batch = False
+
+        if supports_batch and (self.task_config.eval_batch_size or 1) > 1:
+            # Env-driven tqdm controls (shared with single path)
+            pos_env = os.environ.get('EVALSCOPE_TQDM_POSITION', None)
+            try:
+                position = int(pos_env) if pos_env is not None else 0
+            except Exception:
+                position = 0
+            disable = str(os.environ.get('EVALSCOPE_TQDM_DISABLE', '0')).lower() in ('1', 'true', 'yes')
+
+            batch_size = self.task_config.eval_batch_size
+            total = len(dataset_list)
+            from evalscope.api.messages import ChatMessageUser
+
+            with tqdm(total=total, desc=f'Predicting[{self.benchmark_name}@{subset}]: ', position=position,
+                      leave=True, dynamic_ncols=True, disable=disable) as pbar:
+                for start in range(0, total, batch_size):
+                    end = min(start + batch_size, total)
+                    batch = dataset_list[start:end]
+
+                    inputs: List[List[ChatMessage]] = []  # type: ignore[name-defined]
+                    tools_batch: List[List[ToolInfo]] = []  # type: ignore[name-defined]
+                    tool_choices_batch: List[ToolChoice] = []  # type: ignore[name-defined]
+                    configs_batch: List[GenerateConfig] = []  # type: ignore[name-defined]
+
+                    # Build batch inputs
+                    for sample in batch:
+                        if isinstance(sample.input, str):
+                            msg_list = [ChatMessageUser(content=sample.input)]
+                        else:
+                            msg_list = sample.input
+                        inputs.append(msg_list)
+                        tools_batch.append(list(sample.tools) if sample.tools else [])
+                        tool_choices_batch.append('none')
+                        configs_batch.append(self.task_config.generation_config)
+
+                    try:
+                        import time as _t
+                        _bt0 = _t.perf_counter()
+                        batch_outputs = list(self.model.batch_generate(
+                            inputs=inputs,
+                            tools=tools_batch,
+                            tool_choices=tool_choices_batch,
+                            configs=configs_batch,
+                        ))
+                        _bt1 = _t.perf_counter()
+                        # Compute simple perf summary: tok/s if usage present, else chars/s
+                        out_tok = 0
+                        out_chars = 0
+                        for out in batch_outputs:
+                            try:
+                                if out.usage and out.usage.output_tokens:
+                                    out_tok += int(out.usage.output_tokens)
+                                else:
+                                    for c in out.choices or []:
+                                        msg = getattr(c, 'message', None)
+                                        if msg and getattr(msg, 'content', None):
+                                            out_chars += len(str(msg.content))
+                            except Exception:
+                                pass
+                        elapsed = max(1e-6, _bt1 - _bt0)
+                        if out_tok > 0:
+                            pbar.set_postfix({'bs': len(batch_outputs), 'tok/s': f"{out_tok/elapsed:.1f}"}, refresh=False)
+                        elif out_chars > 0:
+                            pbar.set_postfix({'bs': len(batch_outputs), 'chars/s': f"{out_chars/elapsed:.1f}"}, refresh=False)
+                    except Exception as exc:
+                        logger.warning(f'Batch generate failed, fallback to single for this chunk: {exc}')
+                        for sample in batch:
+                            state = self._predict_sample(sample, model_prediction_dir)
+                            task_state_list.append(state)
+                            model_result = self.cache_manager.save_prediction_cache(
+                                subset, state, self.benchmark.save_metadata
+                            )
+                            # logger.debug(f'Model result: \n{model_result.pretty_print()}')
+                            pbar.update(1)
+                        continue
+
+                    # Map outputs back to task states and save, attaching per-sample perf
+                    per_item_time = elapsed / max(1, len(batch_outputs)) if 'elapsed' in locals() else None
+                    for sample, msg_list, output in zip(batch, inputs, batch_outputs):
+                        try:
+                            state = TaskState(
+                                model=self.model_name,
+                                sample=sample,
+                                messages=msg_list,
+                                output=output,
+                                completed=True,
+                            )
+                            # Attach perf similar to _predict_sample
+                            try:
+                                output_text = state.output.completion if state and state.output else ''
+                                output_chars = len(output_text) if isinstance(output_text, str) else 0
+                                output_tokens = None
+                                if state and state.output and state.output.usage:
+                                    output_tokens = state.output.usage.output_tokens or None
+                                gen_time = float(per_item_time) if isinstance(per_item_time, (int, float)) else None
+                                tok_per_s = (float(output_tokens) / gen_time) if (output_tokens is not None and gen_time and gen_time > 0) else None
+                                chars_per_s = (float(output_chars) / gen_time) if (output_chars and gen_time and gen_time > 0) else None
+                                perf = {
+                                    'time_s': gen_time,
+                                    'output_tokens': output_tokens,
+                                    'output_chars': output_chars,
+                                    'tok_per_s': tok_per_s,
+                                    'chars_per_s': chars_per_s,
+                                }
+                                meta = state.metadata or {}
+                                meta['perf'] = perf
+                                state.metadata = meta
+                            except Exception:
+                                pass
+                            task_state_list.append(state)
+                            model_result = self.cache_manager.save_prediction_cache(
+                                subset, state, self.benchmark.save_metadata
+                            )
+                            # logger.debug(f'Model result: \n{model_result.pretty_print()}')
+                        except Exception as exc:
+                            tb_str = traceback.format_exc()
+                            logger.error(
+                                f'{sample.model_dump_json(indent=2)} prediction failed: due to {exc}\nTraceback:\n{tb_str}'
+                            )
+                            if self.task_config.ignore_errors:
+                                logger.warning('Error ignored, continuing with next sample.')
+                            else:
+                                raise exc
+                        finally:
+                            pbar.update(1)
+            logger.info(f'Finished getting predictions for subset: {subset}.')
+            return task_state_list
+
+        # Aggregate perf across completed samples for stable speed in tqdm
+        total_output_tokens: float = 0.0
+        total_output_chars: int = 0
+        total_gen_time: float = 0.0
+        perf_lock = Lock()
+
         # Process samples in parallel using ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=min(len(dataset_list), self.task_config.eval_batch_size)) as executor:
             # Submit all prediction tasks
@@ -196,7 +369,7 @@ class DefaultEvaluator(Evaluator):
                 total=len(dataset_list),
                 desc=f'Predicting[{self.benchmark_name}@{subset}]: ',
                 position=position,
-                leave=False,
+                leave=True,
                 dynamic_ncols=True,
                 disable=disable,
             ) as pbar:
@@ -210,7 +383,32 @@ class DefaultEvaluator(Evaluator):
                         model_result = self.cache_manager.save_prediction_cache(
                             subset, task_state, self.benchmark.save_metadata
                         )
-                        logger.debug(f'Model result: \n{model_result.pretty_print()}')
+                        # logger.debug(f'Model result: \n{model_result.pretty_print()}')
+
+                        # update tqdm postfix with rolling averages for tokens/sec or chars/sec
+                        perf = (task_state.metadata or {}).get('perf', {})
+                        time_s = perf.get('time_s', None)
+                        out_tok = perf.get('output_tokens', None)
+                        out_chars = perf.get('output_chars', None)
+                        with perf_lock:
+                            if isinstance(time_s, (int, float)) and time_s > 0:
+                                if isinstance(out_tok, (int, float)):
+                                    total_output_tokens += float(out_tok)
+                                if isinstance(out_chars, int):
+                                    total_output_chars += int(out_chars)
+                                total_gen_time += float(time_s)
+
+                            avg_tok_ps = (total_output_tokens / total_gen_time) if total_gen_time > 0 and total_output_tokens > 0 else None
+                            avg_char_ps = (total_output_chars / total_gen_time) if total_gen_time > 0 and total_output_chars > 0 else None
+
+                        postfix = {}
+                        if avg_tok_ps is not None:
+                            postfix['avg_tok/s'] = f"{avg_tok_ps:.1f}"
+                        if avg_char_ps is not None and avg_tok_ps is None:
+                            # show chars/s only if tok/s unavailable
+                            postfix['avg_chars/s'] = f"{avg_char_ps:.1f}"
+                        if postfix:
+                            pbar.set_postfix(postfix, refresh=False)
 
                         # update tqdm postfix with perf if available
                         perf = (task_state.metadata or {}).get('perf', {})
@@ -248,7 +446,7 @@ class DefaultEvaluator(Evaluator):
         Returns:
             TaskState: The task state containing the prediction result.
         """
-        logger.debug(f'\n{sample.pretty_print()}')
+        # logger.debug(f'\n{sample.pretty_print()}')
 
         # Run model inference on the current sample with simple perf timing
         import time
@@ -341,7 +539,7 @@ class DefaultEvaluator(Evaluator):
                             sample_score=sample_score,
                             save_metadata=self.benchmark.save_metadata
                         )
-                        logger.debug(f'Review result: \n{review_result.pretty_print()}')
+                        # logger.debug(f'Review result: \n{review_result.pretty_print()}')
                         # Optional: update review bar with sample id
                         pbar.set_postfix({'sample': task_state.sample_id}, refresh=False)
 
@@ -374,7 +572,7 @@ class DefaultEvaluator(Evaluator):
         sample_score = self.benchmark.calculate_metrics(task_state=task_state)
         return sample_score
 
-    def get_report(self, agg_score_dict: Dict[str, List[AggScore]]) -> Report:
+    def get_report(self, agg_score_dict: Dict[str, List[AggScore]], subset_times: Dict[str, float] | None = None) -> Report:
         """
         Generate a comprehensive evaluation report from aggregated scores.
 
@@ -400,6 +598,14 @@ class DefaultEvaluator(Evaluator):
         report = self.benchmark.generate_report(
             scores=agg_score_dict, model_name=self.model_name, output_dir=report_path
         )
+        # Attach preliminary timing so the displayed table reflects non-zero times
+        try:
+            if subset_times:
+                report.subset_times_s = subset_times
+                report.elapsed_time_s = round(sum(subset_times.values()), 3)
+        except Exception:
+            pass
+        # Avoid writing extra JSONs under reports; timing is embedded in report JSON
 
         # Generate and display a summary table of results
         try:

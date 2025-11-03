@@ -27,7 +27,7 @@ def work(gpu_id: int, q: mp.Queue):
         model=MODEL_PATH,
         # tensor_parallel_size=1,
         # gpu_memory_utilization=0.85,
-        enforce_eager=True,
+        # enforce_eager=True,
         # trust_remote_code=True
     )
     sampling_params = SamplingParams(**SAMPLING_KWARGS)
@@ -133,7 +133,7 @@ def work(gpu_id: int, q: mp.Queue):
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     q = mp.Queue()
-    ps = [mp.Process(target=work, args=(i, q)) for i in range(8)]
+    ps = [mp.Process(target=work, args=(i, q)) for i in range(2)]
 
     for p in ps: p.start()
     for p in ps: p.join()

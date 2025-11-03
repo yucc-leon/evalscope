@@ -27,7 +27,10 @@ class ReportGenerator:
                 categories.append(Category(name=category_name, subsets=subsets))
             metrics_list.append(Metric(name=metric_name, categories=categories))
         return Report(
-            name=DataCollection.NAME, metrics=metrics_list, dataset_name=all_dataset_name, model_name=model_name
+            name=DataCollection.NAME,
+            metrics=metrics_list,
+            dataset_name=all_dataset_name,
+            model_name=model_name,
         )
 
     @staticmethod

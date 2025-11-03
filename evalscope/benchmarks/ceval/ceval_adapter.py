@@ -165,5 +165,5 @@ class CEVALAdapter(MultiChoiceAdapter):
         if match:
             return match.group(1)
         else:
-            logger.warning(f'No valid answer found in prediction: {prediction}')
+            # logger.warning(f'No valid answer found in prediction: {prediction}')
             return ''

@@ -117,6 +117,13 @@ class Report:
     score: float = 0.0
     metrics: List[Metric] = field(default_factory=list)
     analysis: str = 'N/A'
+    # Timing metadata
+    # elapsed_time_s: total wall-clock time across subsets (not sum of per-sample times)
+    elapsed_time_s: float = 0.0
+    # subset_times_s: per-subset wall-clock time
+    subset_times_s: Dict[str, float] = field(default_factory=dict)
+    # subset_infer_sum_s: per-subset sum of per-sample inference times (aggregate device-seconds)
+    subset_infer_sum_s: Dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self):
         self.score = self.metrics[0].score  # NOTE: only use the first metric by default
@@ -146,6 +153,9 @@ class Report:
             model_name=data['model_name'],
             metrics=metrics,
             analysis=data.get('analysis', 'N/A'),
+            elapsed_time_s=data.get('elapsed_time_s', 0.0),
+            subset_times_s=data.get('subset_times_s', {}),
+            subset_infer_sum_s=data.get('subset_infer_sum_s', {}),
         )
 
     @classmethod

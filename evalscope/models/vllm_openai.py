@@ -35,44 +35,19 @@ class VllmOpenAIAPI(ModelAPI):
         # lazy import after check
         from vllm import LLM  # type: ignore
 
-        # Normalize and filter model_args to avoid unsupported keys
+        # Sanitize engine args for vLLM
         args: Dict[str, Any] = dict(model_args) if model_args else {}
-        # Map precision/torch_dtype to vLLM dtype
-        precision = args.pop('precision', None) or args.pop('torch_dtype', None)
-        if isinstance(precision, str):
-            p = precision.lower()
-            if 'float16' in p:
-                args['dtype'] = 'float16'
-            elif 'bfloat16' in p:
-                args['dtype'] = 'bfloat16'
-            elif 'float32' in p or 'fp32' in p:
-                args['dtype'] = 'float32'
-            elif 'auto' in p:
-                args['dtype'] = 'auto'
-        # Tokenizer path mapping
+        # Drop precision aliases not supported by vLLM
+        args.pop('precision', None)
+        args.pop('torch_dtype', None)
+        # Map tokenizer_path to tokenizer if provided
         if 'tokenizer_path' in args:
             args['tokenizer'] = args.pop('tokenizer_path')
-        # Drop known non-vLLM keys
-        for k in ['device_map', 'revision', 'chat_template', 'token', 'enable_thinking', 'tokenizer_call_args']:
-            args.pop(k, None)
-        # Whitelist commonly supported vLLM args
-        allowed = {
-            'tensor_parallel_size',
-            'pipeline_parallel_size',
-            'dtype',
-            'gpu_memory_utilization',
-            'enforce_eager',
-            'trust_remote_code',
-            'max_model_len',
-            'max_num_seqs',
-            'tokenizer',
-        }
-        args = {k: v for k, v in args.items() if k in allowed}
+        # Default trust_remote_code for custom models
+        args.setdefault('trust_remote_code', True)
 
-        # Provide safe defaults
-        args.setdefault('dtype', 'auto')
-        args.setdefault('enforce_eager', True)
-
+        logger.info("LLM engine args: %s", args)
+        logger.info("running offline vllm inference with eager=%s", args.get("enforce_eager", False))
         # Initialize the engine following examples/test_chat.py pattern
         self.llm = LLM(model=self.model_name, **args)
 
@@ -146,10 +121,11 @@ class VllmOpenAIAPI(ModelAPI):
             kwargs['top_k'] = config.top_k
         if config.stop_seqs is not None:
             kwargs['stop'] = config.stop_seqs
-        if config.n is not None:
-            kwargs['n'] = config.n
-        if config.best_of is not None:
-            kwargs['best_of'] = config.best_of
+        # Keep n=1 by default; best_of may increase latency noticeably
+        if config.n is not None and config.n > 1:
+            kwargs['n'] = int(config.n)
+        if config.best_of is not None and config.best_of > 1:
+            kwargs['best_of'] = int(config.best_of)
         if config.logprobs is not None:
             kwargs['logprobs'] = config.logprobs
         if config.top_logprobs is not None:
@@ -163,6 +139,145 @@ class VllmOpenAIAPI(ModelAPI):
         """Hook for subclasses to do custom response handling."""
         # no-op for local SDK; keep for parity
         pass
+
+    def supports_batch(self) -> bool:
+        """Indicate that this ModelAPI supports optimized batch processing."""
+        return True
+
+    def batch_generate(
+        self,
+        inputs: List[List[ChatMessage]],
+        tools: List[List[ToolInfo]],
+        tool_choices: List[ToolChoice],
+        configs: List[GenerateConfig],
+    ) -> List[ModelOutput]:
+        """Efficient batch chat generation using vLLM's chat API.
+
+        Group by identical sampling params and call self.llm.chat once per group,
+        preserving full conversation context per item.
+        """
+        # Build vLLM conversations and group indices by config key
+        conversations: List[List[Dict[str, str]]] = [self._to_vllm_conversation(msgs) for msgs in inputs]
+
+        def config_key(cfg: GenerateConfig) -> tuple:
+            # Key on fields used by SamplingParams; omit None to maximize grouping
+            return (
+                cfg.max_tokens,
+                cfg.temperature,
+                cfg.top_p,
+                cfg.top_k,
+                tuple(cfg.stop_seqs or []),
+                cfg.n,
+                cfg.best_of,
+                cfg.logprobs,
+                cfg.top_logprobs,
+                cfg.seed,
+            )
+
+        groups: Dict[tuple, List[int]] = {}
+        for idx, cfg in enumerate(configs):
+            k = config_key(cfg)
+            groups.setdefault(k, []).append(idx)
+
+        outputs: List[Optional[ModelOutput]] = [None] * len(inputs)
+        for k, idxs in groups.items():
+            cfg0 = configs[idxs[0]]
+            sampling_params = self.completion_params(config=cfg0, tools=False)
+            group_convs = [conversations[i] for i in idxs]
+            # Debug preview: show first user turn head and params
+            try:
+                prev = ''
+                first_conv = group_convs[0] if group_convs else []
+                for turn in first_conv:
+                    if turn.get('role') == 'user':
+                        prev = (turn.get('content') or '')[:200]
+                        break
+                # logger.debug('vLLM chat batch size=%d, preview="%s", params=%s',
+                #              len(group_convs), prev, sampling_params)
+            except Exception:
+                pass
+            try:
+                # Use tensor_parallel_size default; avoid forcing low concurrency that serializes batches
+                batched = self.llm.chat(group_convs, sampling_params, use_tqdm=False)
+            except Exception as ex:
+                for i in idxs:
+                    outputs[i] = ModelOutput.from_content(model=self.model_name, content=str(ex), stop_reason='unknown')
+                continue
+
+            # Map responses back to individual ModelOutput
+            for j, i in enumerate(idxs):
+                vout = batched[j]
+                choices: List[ChatCompletionChoice] = []
+                vout_outputs = getattr(vout, 'outputs', [])
+                # If engine returned no outputs, try a single-sample recover via chat
+                if not vout_outputs:
+                    try:
+                        single = self.llm.chat([conversations[i]], sampling_params, use_tqdm=False)
+                        recovered = ''
+                        if single and getattr(single[0], 'outputs', None):
+                            recovered = getattr(single[0].outputs[0], 'text', '') or ''
+                        if recovered.strip():
+                            logger.warning('Empty batch output recovered via single chat (idx=%d)', i)
+                            choices.append(ChatCompletionChoice(
+                                message=ChatMessageAssistant(content=recovered, model=self.model_name, source='generate'),
+                                stop_reason='stop',
+                            ))
+                        else:
+                            logger.warning('Empty chat generation for sample idx=%d (no recovery)', i)
+                    except Exception as rex:
+                        logger.warning('Single chat retry failed for idx=%d: %s', i, rex)
+                else:
+                    for o in vout_outputs:
+                        text = getattr(o, 'text', '') or ''
+                        if not text.strip():
+                            # Try single recovery for empty text
+                            try:
+                                single = self.llm.chat([conversations[i]], sampling_params, use_tqdm=False)
+                                recovered = ''
+                                if single and getattr(single[0], 'outputs', None):
+                                    recovered = getattr(single[0].outputs[0], 'text', '') or ''
+                                if recovered.strip():
+                                    logger.warning('Empty batch choice recovered via single chat (idx=%d)', i)
+                                    text = recovered
+                                else:
+                                    logger.warning('Empty chat generation for sample idx=%d (no recovery)', i)
+                            except Exception as rex:
+                                logger.warning('Single chat retry failed for idx=%d: %s', i, rex)
+                        choices.append(
+                            ChatCompletionChoice(
+                                message=ChatMessageAssistant(content=text, model=self.model_name, source='generate'),
+                                stop_reason='stop',
+                            )
+                        )
+                usage = None
+                try:
+                    prompt_tokens = len(getattr(vout, 'prompt_token_ids', []) or [])
+                    gen_tokens = sum(len(getattr(o, 'token_ids', []) or []) for o in getattr(vout, 'outputs', []))
+                    usage = ModelUsage(
+                        input_tokens=prompt_tokens,
+                        output_tokens=gen_tokens,
+                        total_tokens=prompt_tokens + gen_tokens,
+                    )
+                except Exception:
+                    pass
+                outputs[i] = ModelOutput(model=self.model_name, choices=choices, usage=usage)
+
+        return [out if out is not None else ModelOutput.from_content(self.model_name, '') for out in outputs]
+
+    def _messages_to_prompt(self, messages: List[ChatMessage]) -> str:
+        """Reduce a chat message list to a single prompt string.
+
+        Prefix with the first system message if present, then append the last user message.
+        Assistant/tool content is ignored for prompt construction.
+        """
+        system_text = ''
+        user_text = ''
+        for m in messages:
+            if m.role == 'system' and not system_text:
+                system_text = m.text.strip()
+            elif m.role == 'user':
+                user_text = m.text.strip()
+        return f"{system_text}\n\n{user_text}" if system_text else user_text
 
     def chat_choices_from_completion(self, completion_outputs: List[Any], tools: List[ToolInfo]) -> List[ChatCompletionChoice]:
         """Convert vLLM SDK outputs to EvalScope choices, mirroring OpenAI-compatible conversion."""

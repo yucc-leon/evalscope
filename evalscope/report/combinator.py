@@ -6,7 +6,7 @@ import pandas as pd
 from tabulate import tabulate
 from typing import Dict, List, Tuple, Union
 
-from evalscope.report.report import Report, Subset
+from evalscope.report.report import Report, Subset, ReportKey
 from evalscope.utils.logger import get_logger
 
 logger = get_logger()
@@ -45,6 +45,20 @@ def get_data_frame(
             flatten_categories=flatten_categories,
             add_overall_metric=add_overall_metric
         )
+        # Append timing metadata columns to the flattened table
+        try:
+            # Wall clock per dataset (not sum of per-item times)
+            df['Elapsed(s)'] = report.elapsed_time_s
+            # Per-subset wall time
+            if getattr(report, 'subset_times_s', None):
+                df['SubsetTime(s)'] = df[ReportKey.subset_name].map(lambda s: report.subset_times_s.get(s, None))
+            # Optional: per-subset aggregate inference time (sum of sample times)
+            if getattr(report, 'subset_infer_sum_s', None):
+                df['SubsetInferSum(s)'] = df[ReportKey.subset_name].map(
+                    lambda s: report.subset_infer_sum_s.get(s, None)
+                )
+        except Exception:
+            pass
         tables.append(df)
     return pd.concat(tables, ignore_index=True)
 

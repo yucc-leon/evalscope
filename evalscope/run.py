@@ -3,6 +3,8 @@
 Run evaluation for LLMs.
 """
 import os
+import time
+import json
 from argparse import Namespace
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional, Union
@@ -33,7 +35,8 @@ def run_single_task(task_cfg: TaskConfig, run_time: str) -> dict:
     if task_cfg.seed is not None:
         seed_everything(task_cfg.seed)
     outputs = setup_work_directory(task_cfg, run_time)
-    configure_logging(task_cfg.debug, os.path.join(outputs.logs_dir, 'eval_log.log'))
+    configure_logging(task_cfg.debug, os.path.join(outputs.logs_dir, f'eval_log_{run_time}.log'))
+    task_t0 = time.perf_counter()
 
     if task_cfg.eval_backend != EvalBackend.NATIVE:
         result = run_non_native_backend(task_cfg, outputs)
@@ -43,6 +46,20 @@ def run_single_task(task_cfg: TaskConfig, run_time: str) -> dict:
 
         logger.info(f'Finished evaluation for {task_cfg.model_id} on {task_cfg.datasets}')
         logger.info(f'Output directory: {outputs.outputs_dir}')
+
+    # Record overall task elapsed time and save a summary file
+    try:
+        task_t1 = time.perf_counter()
+        elapsed = round(task_t1 - task_t0, 3)
+        # Save under logs directory to avoid confusing report combinator
+        timing_path = os.path.join(outputs.logs_dir, 'task_timing.json')
+        os.makedirs(outputs.logs_dir, exist_ok=True)
+        with open(timing_path, 'w', encoding='utf-8') as f:
+            json.dump({'task_elapsed_time_s': elapsed, 'model': task_cfg.model_id, 'datasets': task_cfg.datasets}, f,
+                      indent=2)
+        logger.info(f'Task timing saved: {timing_path} (elapsed_s={elapsed})')
+    except Exception:
+        pass
 
     return result
 
@@ -61,7 +78,8 @@ def setup_work_directory(task_cfg: TaskConfig, run_time: str):
         logger.info(f'Reuse results from the same model {task_cfg.model_alias}.')
     else:
         task_cfg.work_dir = os.path.join(task_cfg.work_dir, run_time)
-
+    
+    logger.info(f'Final working directory: {task_cfg.work_dir}')
     outputs = OutputsStructure(outputs_dir=task_cfg.work_dir)
 
     # Unify the output directory structure
@@ -125,8 +143,34 @@ def evaluate_model(task_config: TaskConfig, outputs: OutputsStructure) -> dict:
 
     # Initialize evaluator
     eval_results = {}
-    # Initialize model
-    model = get_model_with_task_config(task_config=task_config)
+    # Decide whether predictions are needed (avoid starting model if fully cached)
+    needs_model = False
+    if task_config.use_cache:
+        try:
+            from evalscope.api.evaluator.cache import CacheManager
+            from evalscope.api.registry import get_benchmark
+            # Probe each dataset to see if any samples remain after cache filtering
+            for dataset_name in task_config.datasets:
+                benchmark = get_benchmark(dataset_name, task_config)
+                dataset = benchmark.load_dataset()
+                cm = CacheManager(outputs=outputs, model_name=task_config.model_id, benchmark_name=benchmark.name)
+                for subset, ds in dataset.items():
+                    # Filter will not modify the original dataset; it returns a filtered view
+                    _, remaining = cm.filter_prediction_cache(subset, ds)
+                    if len(remaining) > 0:
+                        needs_model = True
+                        break
+                if needs_model:
+                    break
+        except Exception:
+            # On any error, conservatively assume we need the model
+            needs_model = True
+    else:
+        needs_model = True
+
+    # Initialize model only if needed
+    model = get_model_with_task_config(task_config=task_config) if needs_model else None
+
     # Initialize evaluators for each dataset
     evaluators: List[Evaluator] = []
     for dataset_name in task_config.datasets:
