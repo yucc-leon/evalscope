@@ -13,17 +13,19 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import json
+import multiprocessing as mp
 import os
 import signal
 import sys
 import time
-import multiprocessing as mp
 from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple
+
 from tqdm import tqdm
 
 from evalscope import TaskConfig
-from evalscope.utils.logger import get_logger, configure_logging
+from evalscope.utils.logger import configure_logging, get_logger
 
 logger = get_logger()
 
@@ -52,6 +54,70 @@ def parse_args():
     p.add_argument('--enable_batch', action='store_true', default=False,
                    help='Enable request-level chat batching (may reduce throughput).')
     return p.parse_args()
+
+
+def _obj_to_dict(obj):
+    """Best-effort conversion to a JSON-serializable dict for debug printing."""
+    try:
+        from dataclasses import is_dataclass
+
+        if is_dataclass(obj):
+            return asdict(obj)
+    except Exception:
+        pass
+    for attr in ('model_dump', 'dict', 'to_dict'):
+        fn = getattr(obj, attr, None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:
+                pass
+    if hasattr(obj, '__dict__'):
+        try:
+            return {k: v for k, v in obj.__dict__.items() if not k.startswith('_')}
+        except Exception:
+            pass
+    return str(obj)
+
+
+def _debug_log_input_preview(item: dict, msg_list: List) -> None:
+    if not item.get('debug') or item.get('global_idx') not in (0, 1):
+        return
+    msg_repr = [_obj_to_dict(m) for m in msg_list]
+    sample_repr = _obj_to_dict(item.get('sample'))
+    logger.info(
+        (
+            f"\n==== DEBUG INPUT PREVIEW SAMPLE #{item.get('global_idx')} ===="
+            f"\nDataset: {item.get('dataset_name')} / {item.get('subset_name')}"
+            f"\nModel: {item.get('model_name')}"
+            f"\n-- Original Sample --\n{json.dumps(sample_repr, ensure_ascii=False, indent=2, default=str)}"
+            f"\n-- Input Messages --\n{json.dumps(msg_repr, ensure_ascii=False, indent=2, default=str)}"
+            f"\n===============================================\n"
+        )
+    )
+
+
+def _debug_log_output_preview(item: dict, msg_list: List, out) -> None:
+    if not item.get('debug') or item.get('global_idx') not in (0, 1):
+        return
+    msg_repr = [_obj_to_dict(m) for m in msg_list]
+    sample_repr = _obj_to_dict(item.get('sample'))
+    out_repr = {
+        'completion': getattr(out, 'completion', None),
+        'usage': getattr(out, 'usage', None),
+        'raw': _obj_to_dict(out),
+    }
+    logger.info(
+        (
+            f"\n==== DEBUG PREVIEW SAMPLE #{item.get('global_idx')} ===="
+            f"\nDataset: {item.get('dataset_name')} / {item.get('subset_name')}"
+            f"\nModel: {item.get('model_name')}"
+            f"\n-- Original Sample --\n{json.dumps(sample_repr, ensure_ascii=False, indent=2, default=str)}"
+            f"\n-- Input Messages --\n{json.dumps(msg_repr, ensure_ascii=False, indent=2, default=str)}"
+            f"\n-- Output --\n{json.dumps(out_repr, ensure_ascii=False, indent=2, default=str)}"
+            f"\n===============================\n"
+        )
+    )
 
 
 def _signal_proc_tree(pid: int, sig: int) -> None:
@@ -183,28 +249,29 @@ def _build_tasks(args) -> List[TaskConfig]:
              cfg=TaskConfig(**base,
                             datasets=['competition_math'],
                             dataset_args={'competition_math': {'few_shot_num': 0}},
-                            generation_config={'max_tokens': max(4096, args.max_tokens), 'temperature': max(0.6, args.temperature), 'top_p': args.top_p})),
-        dict(id='math_500', diff='difficult',
-             cfg=TaskConfig(**base,
-                            datasets=['math_500'],
-                            dataset_args={'math_500': {'few_shot_num': 0}},
-                            generation_config={'max_tokens': max(8192, args.max_tokens), 'temperature': max(0.6, args.temperature), 'top_p': args.top_p},
-                            repeats=4)),
+                            generation_config={'max_tokens': max(2048, args.max_tokens), 'temperature': max(0.6, args.temperature), 'top_p': args.top_p})),
+        # dict(id='math_500', diff='difficult',
+        #      cfg=TaskConfig(**base,
+        #                     datasets=['math_500'],
+        #                     dataset_args={'math_500': {'few_shot_num': 0}},
+        #                     generation_config={'max_tokens': max(4096, args.max_tokens), 'temperature': max(0.6, args.temperature), 'top_p': args.top_p},
+        #                     repeats=4)),
         dict(id='aime24', diff='difficult',
              cfg=TaskConfig(**base,
                             datasets=['aime24'],
                             dataset_args={'aime24': {'few_shot_num': 0}},
-                            generation_config={'max_tokens': max(8192, args.max_tokens), 'temperature': max(0.6, args.temperature), 'top_p': args.top_p},
+                            generation_config={'max_tokens': max(4096, args.max_tokens), 'temperature': max(0.6, args.temperature), 'top_p': args.top_p},
                             repeats=8)),
         dict(id='aime25', diff='difficult',
              cfg=TaskConfig(**base,
                             datasets=['aime25'],
                             dataset_args={'aime25': {'few_shot_num': 0}},
-                            generation_config={'max_tokens': max(8192, args.max_tokens), 'temperature': max(0.6, args.temperature), 'top_p': args.top_p},
+                            generation_config={'max_tokens': max(4096, args.max_tokens), 'temperature': max(0.6, args.temperature), 'top_p': args.top_p},
                             repeats=8)),
     ]
     if args.task_set == 'quick':
         return [d['cfg'] for d in defs if d['diff'] == 'quick']
+        
     if args.task_set == 'easy':
         return [d['cfg'] for d in defs if d['diff'] == 'easy']
     if args.task_set == 'difficult':
@@ -220,6 +287,7 @@ def _prepare_work_items(tasks: List[TaskConfig]) -> List[dict]:
     from evalscope.api.registry import get_benchmark
 
     items: List[dict] = []
+    global_idx = 0
     for t in tasks:
         # Align with setup_work_directory semantics: prefer use_cache; else derive from model_alias
         if t.model_alias and not t.use_cache:
@@ -241,7 +309,11 @@ def _prepare_work_items(tasks: List[TaskConfig]) -> List[dict]:
                         'sample': sample,
                         'generation_config': t.generation_config,
                         'model_args': t.model_args,
+                        # Debug/preview helpers
+                        'debug': bool(getattr(t, 'debug', False)),
+                        'global_idx': global_idx,
                     })
+                    global_idx += 1
     return items
 
 
@@ -342,6 +414,13 @@ def worker(gpu_id: int, rank: int, queue: mp.JoinableQueue, enable_batch: bool, 
             tool_choices.append('none')
             configs.append(it['generation_config'])
 
+        # Optional pre-generation debug preview for the first two samples
+        try:
+            for idx_preview, it_preview in enumerate(batch):
+                _debug_log_input_preview(it_preview, messages_per_item[idx_preview])
+        except Exception as _dbg_exc:
+            logger.warning(f"[GPU {gpu_id}] Debug pre-generate preview failed: {_dbg_exc}")
+
         # Run batch chat generation with timing
         try:
             _t0 = time.perf_counter()
@@ -373,6 +452,12 @@ def worker(gpu_id: int, rank: int, queue: mp.JoinableQueue, enable_batch: bool, 
                 outputs = OutputsStructure(outputs_dir=it['work_dir'])
                 cm = CacheManager(outputs=outputs, model_name=it['model_id'], benchmark_name=it['dataset_name'])
                 caches[key] = cm
+
+            # Pretty-print the first two samples' inputs and outputs when debug is enabled
+            try:
+                _debug_log_output_preview(it, messages_per_item[idx], out)
+            except Exception as _dbg_exc:
+                logger.warning(f"[GPU {gpu_id}] Debug pretty-print failed: {_dbg_exc}")
             try:
                 state = TaskState(
                     model=it['model_id'],
@@ -414,6 +499,11 @@ def worker(gpu_id: int, rank: int, queue: mp.JoinableQueue, enable_batch: bool, 
 
 def main():
     args = parse_args()
+    # Enable verbose logging in debug mode
+    try:
+        configure_logging(debug=bool(getattr(args, 'debug', False)))
+    except Exception:
+        pass
     _install_signal_handlers()
     atexit.register(lambda: _terminate_children(timeout=5.0))
 
@@ -445,6 +535,10 @@ def main():
     # Build tasks and work items
     tasks = _build_tasks(args)
     items = _prepare_work_items(tasks)
+    if args.debug:
+        # Only run and print first two samples in debug mode
+        items = items[:2]
+        logger.info(f'DEBUG mode: limiting to first {len(items)} sample(s) and exiting after inference.')
     logger.info(f'Total work items: {len(items)}')
 
     # Shared queue across workers
@@ -453,6 +547,9 @@ def main():
     progress_q: mp.Queue = ctx.Queue()
 
     # Start workers (keep GPU busy by feeding queue until empty)
+    # In debug mode, limit workers to at most two for quick turnaround
+    if args.debug:
+        selected_ids = selected_ids[:max(1, min(2, len(selected_ids)))]
     procs = []
     for i, gid in enumerate(selected_ids):
         p = ctx.Process(target=worker, args=(gid, i, queue, args.enable_batch, args.batch_size, progress_q))
@@ -522,6 +619,9 @@ def main():
         p.join()
 
     # After predictions, run evaluators to compute reviews and reports
+    if args.debug:
+        logger.info('DEBUG mode complete: skipping evaluator and exiting.')
+        return
     from evalscope.run import run_task
     for t in tasks:
         try:

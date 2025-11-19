@@ -194,7 +194,8 @@ def messages_pretty_str(messages: List[ChatMessage]) -> str:
                 content += f'\nError: {message.error.message}'
             if message.function:
                 content += f'\nFunction: {message.function}'
-        output.append(f'**{role}**: {content}')
+        # output.append(f'**{role}**: {content}')
+        output.append(content)
     return '\n\n'.join(output)
 
 
