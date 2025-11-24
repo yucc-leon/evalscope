@@ -4,6 +4,6 @@
 #     --task_set quick
 
 python examples/run_vllm_sdk_dynamic_samples.py \
-    --model /sharedata/liyuchen/ckpts/zm75kckpt/hf \
-    --model_alias convert_debugging \
-    --task_set quick
+    --model /sharedata/liyuchen/ckpts/zm60b_sft_pp8_ep4_math_sft-pack3-4nodescmp/hf \
+    --model_alias pack3-cmp \
+    --task_set all
