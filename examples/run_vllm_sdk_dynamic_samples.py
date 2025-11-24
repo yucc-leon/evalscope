@@ -250,12 +250,12 @@ def _build_tasks(args) -> List[TaskConfig]:
                             datasets=['competition_math'],
                             dataset_args={'competition_math': {'few_shot_num': 0}},
                             generation_config={'max_tokens': max(2048, args.max_tokens), 'temperature': max(0.6, args.temperature), 'top_p': args.top_p})),
-        # dict(id='math_500', diff='difficult',
-        #      cfg=TaskConfig(**base,
-        #                     datasets=['math_500'],
-        #                     dataset_args={'math_500': {'few_shot_num': 0}},
-        #                     generation_config={'max_tokens': max(4096, args.max_tokens), 'temperature': max(0.6, args.temperature), 'top_p': args.top_p},
-        #                     repeats=4)),
+        dict(id='math_500', diff='difficult',
+             cfg=TaskConfig(**base,
+                            datasets=['math_500'],
+                            dataset_args={'math_500': {'few_shot_num': 0}},
+                            generation_config={'max_tokens': max(4096, args.max_tokens), 'temperature': max(0.6, args.temperature), 'top_p': args.top_p},
+                            repeats=4)),
         dict(id='aime24', diff='difficult',
              cfg=TaskConfig(**base,
                             datasets=['aime24'],
@@ -280,40 +280,55 @@ def _build_tasks(args) -> List[TaskConfig]:
 
 
 def _prepare_work_items(tasks: List[TaskConfig]) -> List[dict]:
-    """Load datasets and expand into sample-level work items.
-
-    Each item contains: model_id, work_dir, dataset_name, subset_name, sample, generation_config.
-    """
+    """Load datasets, drop cached samples, and expand the remaining ones into work items."""
     from evalscope.api.registry import get_benchmark
+    from evalscope.api.evaluator.cache import CacheManager
+    from evalscope.utils.io_utils import OutputsStructure
 
     items: List[dict] = []
     global_idx = 0
+    reused = 0
     for t in tasks:
-        # Align with setup_work_directory semantics: prefer use_cache; else derive from model_alias
         if t.model_alias and not t.use_cache:
-            # Use stable path to reuse caches and results
             t.use_cache = os.path.join(t.work_dir, t.model_alias)
+
+        work_dir = t.use_cache or t.work_dir
+        outputs = OutputsStructure(outputs_dir=work_dir, is_make=False)
 
         for ds_name in t.datasets:
             adapter = get_benchmark(ds_name, t)
             ds_dict = adapter.load_dataset()
+            cache_mgr = CacheManager(outputs=outputs, model_name=t.model_id, benchmark_name=adapter.name)
             for subset_name, dataset in ds_dict.items():
-                for sample in dataset:
+                cached_states, remaining = cache_mgr.filter_prediction_cache(subset_name, dataset)
+                cached_cnt = len(cached_states)
+                remaining_cnt = len(remaining)
+                if cached_cnt > 0:
+                    reused += cached_cnt
+                    logger.info(
+                        f"[CACHE] {adapter.name}/{subset_name}: reused {cached_cnt} prediction(s), left {remaining_cnt}")
+                if remaining_cnt == 0:
+                    continue
+                for sample in remaining:
                     items.append({
                         'model_id': t.model_id,
                         'model_name': (t.model if isinstance(t.model, str) else t.model_id),
-                        # Use stable cache path for saving predictions
-                        'work_dir': t.use_cache or t.work_dir,
+                        'work_dir': work_dir,
                         'dataset_name': adapter.name,
                         'subset_name': subset_name,
                         'sample': sample,
                         'generation_config': t.generation_config,
                         'model_args': t.model_args,
-                        # Debug/preview helpers
                         'debug': bool(getattr(t, 'debug', False)),
                         'global_idx': global_idx,
                     })
                     global_idx += 1
+
+    if reused > 0:
+        logger.info(f'Reused {reused} cached prediction(s) before dispatching new work items.')
+    else:
+        logger.info('No cached predictions found; dispatching all samples for generation.')
+
     return items
 
 
@@ -622,6 +637,7 @@ def main():
     if args.debug:
         logger.info('DEBUG mode complete: skipping evaluator and exiting.')
         return
+
     from evalscope.run import run_task
     for t in tasks:
         try:
