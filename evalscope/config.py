@@ -119,7 +119,7 @@ class TaskConfig(BaseArgument):
     judge_strategy: str = JudgeStrategy.AUTO
     """Strategy for LLM-based judgment (auto, single, pairwise)."""
 
-    judge_worker_num: int = 1
+    judge_worker_num: int = 32
     """Number of worker processes for parallel LLM judging."""
 
     judge_model_args: Optional[Dict] = field(default_factory=dict)

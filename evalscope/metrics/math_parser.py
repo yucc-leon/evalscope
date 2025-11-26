@@ -307,45 +307,20 @@ def choice_answer_clean(pred: str):
     return pred
 
 
-def _cleanup_numeric_token(token: str) -> str:
-    token = token.strip()
-    if not token:
-        return token
-
-    # normalize escaped currency markers ("\$" -> "$") and drop trailing escapes
-    token = token.replace('\\$', '$').rstrip('\\')
-
-    # support patterns like "-$12.5" and "$-12.5"
-    if token.startswith('-$'):
-        token = '-' + token[2:]
-    elif token.startswith('$-'):
-        token = '-' + token[2:]
-    elif token.startswith('$'):
-        token = token[1:]
-
-    return token
-
-
 def parse_digits(num):
-    num = regex.sub(',', '', str(num)).strip()
-    if not num:
-        return None
-
-    num = _cleanup_numeric_token(num)
-
-    pct = False
-    if num.endswith('%'):
-        pct = True
-        num = num[:-1]
-
+    num = regex.sub(',', '', str(num))
     try:
-        value = float(num)
+        return float(num)
     except Exception:
-        return None
-
-    if pct:
-        return value / 100
-    return value
+        if num.endswith('%'):
+            num = num[:-1]
+            if num.endswith('\\'):
+                num = num[:-1]
+            try:
+                return float(num) / 100
+            except Exception:
+                pass
+    return None
 
 
 def is_digit(num):
@@ -502,16 +477,8 @@ def math_equal(
     return False
 
 
-def _normalize_numeric_for_compare(value: float):
-    if value.is_integer():
-        return int(value)
-    return value
-
-
 def numeric_equal(prediction: float, reference: float):
-    prediction = _normalize_numeric_for_compare(float(prediction))
-    reference = _normalize_numeric_for_compare(float(reference))
-    return prediction == reference or isclose(reference, prediction, rel_tol=1e-4)
+    return isclose(reference, prediction, rel_tol=1e-4)
 
 
 def symbolic_equal(a, b):

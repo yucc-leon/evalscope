@@ -90,24 +90,13 @@ class GSM8KAdapter(DefaultDataAdapter):
             return ''
 
     def extract_answer(self, prediction: str, task_state: TaskState):
-        # Prefer boxed answers following the GSM8K prompt template,
-        # but tolerate intermediate wrappers like \displaystyle or nested \text{}.
-        boxed_match = re.search(r"\\boxed{((?:[^{}]|{[^{}]*})*)}", prediction)
+        boxed_match = re.search(r'\\boxed\\{\\text\\{([^}]*)\\}\\}', prediction)
         if boxed_match:
-            extracted = boxed_match.group(1).strip()
-            extracted = re.sub(r'^\\displaystyle\\s*', '', extracted, flags=re.IGNORECASE).strip()
-            text_wrapped = re.fullmatch(r'\\text\{(.+)\}', extracted)
-            if text_wrapped:
-                extracted = text_wrapped.group(1).strip()
-            extracted = re.sub(r'^(?:[Aa]ns(?:wer)?|[Rr]esult)\s*[:=]\s*', '', extracted)
-            return extracted
+            result = boxed_match.group(1).strip()
+            return result.strip()
 
         from evalscope.filters.extraction import RegexFilter
 
-        # Fallback: capture the final numeric-looking token, including currency prefices and decimals.
-        regex = RegexFilter(regex_pattern=r'-?\$?(?:\d[\d,]*(?:\.\d+)?|\.\d+)', group_select=-1)
+        regex = RegexFilter(regex_pattern=r'(-?[0-9.,]{2,})|(-?[0-9]+)', group_select=-1)
         res = regex(prediction)
-        res = res.replace(',', '').replace('$', '').strip()
-        if res.endswith('.'):
-            res = res[:-1]
-        return res
+        return res.replace(',', '').replace('+', '').strip().strip('.')
