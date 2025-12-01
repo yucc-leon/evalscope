@@ -100,3 +100,37 @@ class GSM8KAdapter(DefaultDataAdapter):
         regex = RegexFilter(regex_pattern=r'(-?[0-9.,]{2,})|(-?[0-9]+)', group_select=-1)
         res = regex(prediction)
         return res.replace(',', '').replace('+', '').strip().strip('.')
+    # def extract_answer(self, prediction: str, task_state: TaskState):
+
+    #     # ---- 1. 匹配 \boxed{...}，更宽松 ----
+    #     boxed_match = re.search(
+    #         r'\\boxed\s*\{\s*(?:\\text\s*\{)?([^}\n]+)\}?',
+    #         prediction,
+    #         flags=re.IGNORECASE
+    #     )
+    #     if boxed_match:
+    #         return boxed_match.group(1).strip()
+
+    #     # ---- 2. 匹配 “答案: xxx” / “answer is xxx” 等 ----
+    #     ans_match = re.search(
+    #         r'(?:答案|answer|final answer|result)\s*[:=]\s*([\w\./+-]+)',
+    #         prediction,
+    #         flags=re.IGNORECASE
+    #     )
+    #     if ans_match:
+    #         return ans_match.group(1).strip()
+
+    #     # ---- 3. 更通用的数字抽取（支持小数、科学计数法、分数）----
+    #     num_match = re.search(
+    #         r'-?\d+(?:\.\d+)?(?:e[+-]?\d+)?| -?\d+/\d+',
+    #         prediction,
+    #         flags=re.IGNORECASE
+    #     )
+    #     if num_match:
+    #         return num_match.group(0).replace(" ", "")
+
+    #     # ---- 4. 最后的 fallback（保持你的 RegexFilter，但更安全）----
+    #     from evalscope.filters.extraction import RegexFilter
+    #     regex = RegexFilter(regex_pattern=r'-?[0-9]+(?:\.[0-9]+)?', group_select=0)
+    #     res = regex(prediction)
+    #     return res.strip().strip('.')

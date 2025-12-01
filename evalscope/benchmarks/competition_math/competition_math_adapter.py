@@ -47,6 +47,7 @@ Here are some examples of how to solve similar problems:
         eval_split='test',
         prompt_template=PROMPT_TEMPLATE,
         few_shot_prompt_template=FEWSHOT_TEMPLATE,
+        review_timeout=5,
     )
 )
 class CompetitionMathAdapter(DefaultDataAdapter):

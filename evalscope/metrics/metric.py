@@ -45,7 +45,15 @@ class Accuracy(ExactMatch):
             for prediction, reference in zip(predictions, references):
                 pred_answer = extract_answer(prediction)
                 ref_answer = strip_answer_string(reference)
-                results.append(float(math_equal(pred_answer, ref_answer)))
+                
+                # Add exception protection (the real issue was ThreadPoolExecutor,
+                # not individual slow operations, so this is just a safety measure)
+                try:
+                    result = math_equal(pred_answer, ref_answer)
+                    results.append(float(result))
+                except Exception:
+                    # If math_equal fails, return 0
+                    results.append(0.0)
 
             return results
         else:

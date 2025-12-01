@@ -510,50 +510,81 @@ class DefaultEvaluator(Evaluator):
             return sample_score_list
 
         logger.info(f'Reviewing {len(task_states)} samples, if data is large, it may take a while.')
-        # Process task states in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=min(len(task_states), self.task_config.judge_worker_num)) as executor:
-            # Submit all review tasks
-            future_to_task_state = {
-                executor.submit(self._review_task_state, task_state): task_state
-                for task_state in task_states
-            }
-
-            # Process completed tasks with progress bar
-            with tqdm(total=len(task_states), desc=f'Reviewing[{self.benchmark_name}@{subset}]: ') as pbar:
-                for future in as_completed(future_to_task_state):
-                    task_state = future_to_task_state[future]
+        
+        # Get review timeout from benchmark config
+        review_timeout = getattr(self.benchmark, 'review_timeout', 5)
+        if review_timeout is None:
+            review_timeout = 5
+        
+        # IMPORTANT: Use serial processing instead of ThreadPoolExecutor
+        # SymPy (used in math metric calculations) is NOT thread-safe and can cause
+        # deadlocks when multiple threads call symbolic operations concurrently.
+        # Serial processing is slower but avoids these concurrency issues.
+        
+        # Note: We keep the signal-based timeout as a safety measure, though
+        # it may not be strictly necessary now that we've identified the real issue.
+        import signal
+        
+        has_alarm = hasattr(signal, 'SIGALRM')
+        
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Review timed out")
+        
+        logger.info(f'Processing reviews serially to avoid SymPy thread-safety issues...')
+        
+        with tqdm(total=len(task_states), desc=f'Reviewing[{self.benchmark_name}@{subset}]: ') as pbar:
+            for task_state in task_states:
+                try:
+                    # Apply timeout protection (safety measure)
+                    if has_alarm:
+                        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+                        signal.alarm(review_timeout)
+                    
                     try:
-                        try:
-                            sample_score = future.result()
-                        except TimeoutError:
-                            logger.warning(
-                                f'Timeout when reviewing sample {task_state.sample_id}, setting score to zero.'
-                            )
-                            sample_score = SampleScore(sample_id=task_state.sample_id, scores={})
-                        sample_score_list.append(sample_score)
-
-                        # Save the review result to cache for future use
-                        review_result = self.cache_manager.save_review_cache(
-                            subset=subset,
-                            task_state=task_state,
-                            sample_score=sample_score,
-                            save_metadata=self.benchmark.save_metadata
-                        )
-                        # logger.debug(f'Review result: \n{review_result.pretty_print()}')
-                        # Optional: update review bar with sample id
-                        pbar.set_postfix({'sample': task_state.sample_id}, refresh=False)
-
-                    except Exception as exc:
-                        tb_str = traceback.format_exc()
-                        logger.error(
-                            f'Error when review sample {task_state.sample_id}: due to {exc}\nTraceback:\n{tb_str}'
-                        )
-                        if self.task_config.ignore_errors:
-                            logger.warning('Error ignored, continuing with next sample.')
-                        else:
-                            raise exc
+                        sample_score = self._review_task_state(task_state)
                     finally:
-                        pbar.update(1)
+                        if has_alarm:
+                            signal.alarm(0)  # Cancel alarm
+                            signal.signal(signal.SIGALRM, old_handler)  # Restore handler
+                    
+                    # Save the sample score
+                    sample_score_list.append(sample_score)
+                    
+                    # Save the review result to cache for future use
+                    review_result = self.cache_manager.save_review_cache(
+                        subset=subset,
+                        task_state=task_state,
+                        sample_score=sample_score,
+                        save_metadata=self.benchmark.save_metadata
+                    )
+                    # Optional: update review bar with sample id
+                    pbar.set_postfix({'sample': task_state.sample_id}, refresh=False)
+                    
+                except TimeoutError:
+                    logger.warning(
+                        f'Timeout when reviewing sample {task_state.sample_id} (>{review_timeout}s), setting score to zero.'
+                    )
+                    sample_score = SampleScore(sample_id=task_state.sample_id, scores={})
+                    sample_score_list.append(sample_score)
+                    # Save the zero score to cache
+                    self.cache_manager.save_review_cache(
+                        subset=subset,
+                        task_state=task_state,
+                        sample_score=sample_score,
+                        save_metadata=self.benchmark.save_metadata
+                    )
+
+                except Exception as exc:
+                    tb_str = traceback.format_exc()
+                    logger.error(
+                        f'Error when review sample {task_state.sample_id}: due to {exc}\nTraceback:\n{tb_str}'
+                    )
+                    if self.task_config.ignore_errors:
+                        logger.warning('Error ignored, continuing with next sample.')
+                    else:
+                        raise exc
+                finally:
+                    pbar.update(1)
         logger.info(f'Finished reviewing subset: {subset}. Total reviewed: {len(sample_score_list)}')
 
         return sample_score_list

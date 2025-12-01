@@ -4,6 +4,6 @@
 #     --task_set quick
 
 python examples/run_vllm_sdk_dynamic_samples.py \
-    --model /sharedata/liyuchen/ckpts/zm60b_sft_pp8_ep4_math_sft-pack3-4nodescmp/hf \
-    --model_alias pack3-cmp \
+    --model /sharedata/liyuchen/ckpts/zm60b_sft_pp8_ep4_math_sft-math-pack/hf \
+    --model_alias math_only \
     --task_set all

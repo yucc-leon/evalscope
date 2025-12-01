@@ -482,6 +482,15 @@ def numeric_equal(prediction: float, reference: float):
 
 
 def symbolic_equal(a, b):
+    """
+    Check symbolic equality with safety measures.
+    
+    NOTE: The original issue with "hanging" was due to ThreadPoolExecutor
+    causing SymPy thread-safety issues, not individual slow operations.
+    We now use serial processing in the evaluator to avoid concurrency issues.
+    
+    This function still includes safety measures for very complex expressions.
+    """
 
     def _parse(s):
         for f in [parse_latex, parse_expr, latex2sympy]:
@@ -494,8 +503,15 @@ def symbolic_equal(a, b):
                     pass
         return s
 
-    a = _parse(a)
-    b = _parse(b)
+    # Quick string comparison first
+    if str(a).strip() == str(b).strip():
+        return True
+    
+    try:
+        a = _parse(a)
+        b = _parse(b)
+    except Exception:
+        return False
 
     # direct equal
     try:
@@ -504,20 +520,37 @@ def symbolic_equal(a, b):
     except Exception:
         pass
 
-    # simplify equal
+    # Check expression complexity to avoid extremely long expressions
+    # Set a reasonable threshold to skip pathological cases
     try:
-        if a.equals(b) or simplify(a - b) == 0:
-            return True
+        a_str = str(a)
+        b_str = str(b)
+        # Skip extremely complex expressions (increased from 200 back to 500)
+        if len(a_str) > 500 or len(b_str) > 500:
+            return False
     except Exception:
         pass
+
+    # Try equals() method (safe in serial processing)
+    try:
+        if hasattr(a, 'equals') and hasattr(b, 'equals'):
+            if a.equals(b):
+                return True
+    except Exception:
+        pass
+
+    # Skip simplify() as it can be very slow even in serial processing
+    # Original code had: if a.equals(b) or simplify(a - b) == 0
 
     # equation equal
     try:
-        if (abs(a.lhs - a.rhs)).equals(abs(b.lhs - b.rhs)):
-            return True
+        if hasattr(a, 'lhs') and hasattr(b, 'lhs'):
+            if (abs(a.lhs - a.rhs)).equals(abs(b.lhs - b.rhs)):
+                return True
     except Exception:
         pass
 
+    # Try numeric comparison
     try:
         if numeric_equal(float(N(a)), float(N(b))):
             return True
@@ -526,8 +559,7 @@ def symbolic_equal(a, b):
 
     # matrix
     try:
-        # if a and b are matrix
-        if a.shape == b.shape:
+        if hasattr(a, 'shape') and hasattr(b, 'shape') and a.shape == b.shape:
             _a = a.applyfunc(lambda x: round(x, 3))
             _b = b.applyfunc(lambda x: round(x, 3))
             if _a.equals(_b):
