@@ -44,7 +44,7 @@ def parse_args():
     p.add_argument('--top_k', type=int, default=None)
     p.add_argument('--model', type=str,
                   default="/sharedata/zimoliu/ckpts/jamba_60b_aws_oh_pp8_ep4_efa_512k_sft_v1_16node_ckpt75000/hf")
-    p.add_argument('--model_alias', type=str, default='zm60b',
+    p.add_argument('--model_alias', type=str, default='test',
                    help="Name of the evaluated model version for cache reuse.")
     p.add_argument('--task_set', type=str, choices=['quick', 'easy', 'difficult', 'all'], default='all',
                    help='Select which task set to run')
@@ -53,6 +53,8 @@ def parse_args():
     p.add_argument('--debug', action='store_true', default=False, help='Enable debug logging')
     p.add_argument('--enable_batch', action='store_true', default=False,
                    help='Enable request-level chat batching (may reduce throughput).')
+    p.add_argument('--dry_run', action='store_true', default=False,
+                   help='Dry-run mode: only load datasets without starting vLLM or using GPU.')
     return p.parse_args()
 
 
@@ -279,15 +281,27 @@ def _build_tasks(args) -> List[TaskConfig]:
     return [d['cfg'] for d in defs]
 
 
-def _prepare_work_items(tasks: List[TaskConfig]) -> List[dict]:
-    """Load datasets, drop cached samples, and expand the remaining ones into work items."""
+def _prepare_work_items(tasks: List[TaskConfig], return_stats: bool = False):
+    """Load datasets, drop cached samples, and expand the remaining ones into work items.
+    
+    Args:
+        tasks: List of TaskConfig to process
+        return_stats: If True, return (items, stats) tuple; otherwise return items only
+        
+    Returns:
+        If return_stats is False: List[dict] of work items
+        If return_stats is True: Tuple[List[dict], dict] where stats contains dataset statistics
+    """
     from evalscope.api.registry import get_benchmark
     from evalscope.api.evaluator.cache import CacheManager
     from evalscope.utils.io_utils import OutputsStructure
+    from collections import defaultdict
 
     items: List[dict] = []
     global_idx = 0
     reused = 0
+    stats = defaultdict(lambda: {'total': 0, 'cached': 0, 'remaining': 0}) if return_stats else None
+    
     for t in tasks:
         if t.model_alias and not t.use_cache:
             t.use_cache = os.path.join(t.work_dir, t.model_alias)
@@ -300,9 +314,72 @@ def _prepare_work_items(tasks: List[TaskConfig]) -> List[dict]:
             ds_dict = adapter.load_dataset()
             cache_mgr = CacheManager(outputs=outputs, model_name=t.model_id, benchmark_name=adapter.name)
             for subset_name, dataset in ds_dict.items():
-                cached_states, remaining = cache_mgr.filter_prediction_cache(subset_name, dataset)
+                total_cnt = len(dataset)
+                # Build a mapping from sample.id to sample for efficient lookup
+                sample_id_to_sample = {sample.id: sample for sample in dataset if sample.id is not None}
+                
+                # Try to filter cache, but handle index mismatches gracefully
+                cached_states = []
+                cached_sample_ids = set()
+                cache_file = cache_mgr.get_prediction_cache_path(subset_name)
+                
+                if os.path.exists(cache_file):
+                    from evalscope.utils.io_utils import jsonl_to_list
+                    from evalscope.api.evaluator.cache import ModelResult
+                    from evalscope.api.evaluator.state import TaskState
+                    from evalscope.api.model import ModelOutput
+                    
+                    cache_items = jsonl_to_list(cache_file)
+                    skipped_invalid = 0
+                    
+                    for cache_item in cache_items:
+                        try:
+                            cached_model_result = ModelResult.model_validate(cache_item)
+                            # Try to find sample by sample_id instead of position index
+                            sample_id = cached_model_result.index  # This is actually sample_id
+                            
+                            if sample_id in sample_id_to_sample:
+                                sample = sample_id_to_sample[sample_id]
+                                # Update metadata if exists
+                                if cached_model_result.metadata:
+                                    sample.metadata.update(cached_model_result.metadata)
+                                
+                                cached_state = TaskState(
+                                    model=cached_model_result.model,
+                                    sample=sample,
+                                    messages=cached_model_result.messages,
+                                    output=ModelOutput.model_validate(cached_model_result.model_output),
+                                    completed=True,
+                                )
+                                cached_states.append(cached_state)
+                                cached_sample_ids.add(sample_id)
+                            else:
+                                skipped_invalid += 1
+                        except Exception as e:
+                            skipped_invalid += 1
+                            continue
+                    
+                    if skipped_invalid > 0:
+                        logger.warning(
+                            f"[CACHE] {adapter.name}/{subset_name}: skipped {skipped_invalid} invalid cache entries "
+                            f"(sample_id not found in current dataset)")
+                
+                # Filter out cached samples from dataset
+                remaining = [sample for sample in dataset if sample.id not in cached_sample_ids]
                 cached_cnt = len(cached_states)
                 remaining_cnt = len(remaining)
+                
+                if cached_cnt > 0:
+                    logger.info(
+                        f"[CACHE] {adapter.name}/{subset_name}: reused {cached_cnt} prediction(s), "
+                        f"left {remaining_cnt} samples")
+                
+                if return_stats:
+                    key = f'{adapter.name}/{subset_name}'
+                    stats[key]['total'] = total_cnt
+                    stats[key]['cached'] = cached_cnt
+                    stats[key]['remaining'] = remaining_cnt
+                
                 if cached_cnt > 0:
                     reused += cached_cnt
                     logger.info(
@@ -329,6 +406,8 @@ def _prepare_work_items(tasks: List[TaskConfig]) -> List[dict]:
     else:
         logger.info('No cached predictions found; dispatching all samples for generation.')
 
+    if return_stats:
+        return items, dict(stats)
     return items
 
 
@@ -522,6 +601,49 @@ def main():
     _install_signal_handlers()
     atexit.register(lambda: _terminate_children(timeout=5.0))
 
+    # Build tasks and work items
+    tasks = _build_tasks(args)
+    
+    # Dry-run mode: only load datasets and print statistics, then exit
+    if args.dry_run:
+        items, dataset_stats = _prepare_work_items(tasks, return_stats=True)
+        
+        logger.info('=' * 80)
+        logger.info('DRY-RUN MODE: Dataset loading complete (no vLLM/GPU used)')
+        logger.info('=' * 80)
+        
+        # Print task summary
+        logger.info(f'\nTask Summary:')
+        logger.info(f'  Total tasks: {len(tasks)}')
+        for i, t in enumerate(tasks, 1):
+            logger.info(f'  Task {i}: {t.model_id} on {t.datasets}')
+        
+        # Print dataset statistics
+        logger.info(f'\nDataset Statistics:')
+        total_samples = 0
+        total_cached = 0
+        total_remaining = 0
+        for key in sorted(dataset_stats.keys()):
+            stats = dataset_stats[key]
+            logger.info(f'  {key}:')
+            logger.info(f'    Total: {stats["total"]}')
+            logger.info(f'    Cached: {stats["cached"]}')
+            logger.info(f'    Remaining: {stats["remaining"]}')
+            total_samples += stats['total']
+            total_cached += stats['cached']
+            total_remaining += stats['remaining']
+        
+        logger.info(f'\nOverall Statistics:')
+        logger.info(f'  Total samples: {total_samples}')
+        logger.info(f'  Cached samples: {total_cached}')
+        logger.info(f'  Remaining samples: {total_remaining}')
+        logger.info(f'  Work items to process: {len(items)}')
+        logger.info('=' * 80)
+        logger.info('Dry-run complete. Exiting without starting vLLM or using GPU.')
+        return
+    
+    items = _prepare_work_items(tasks)
+
     # Determine number of GPUs
     if args.max_use_gpu <= 0:
         try:
@@ -547,9 +669,6 @@ def main():
         selected_ids = [g['id'] for g in sorted(candidates, key=lambda x: x['mem_free_mb'], reverse=True)[:available]]
         world_size = available
 
-    # Build tasks and work items
-    tasks = _build_tasks(args)
-    items = _prepare_work_items(tasks)
     if args.debug:
         # Only run and print first two samples in debug mode
         items = items[:2]

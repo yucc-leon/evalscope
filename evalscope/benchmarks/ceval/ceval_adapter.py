@@ -92,7 +92,7 @@ FEWSHOT_TEMPLATE = """以下是一些示例问题：
         metric_list=['acc'],
         few_shot_num=5,
         train_split='dev',
-        eval_split='val',
+        eval_split='test',
         prompt_template=USER_PROMPT_TEMPLATE,
         few_shot_prompt_template=FEWSHOT_TEMPLATE,
     )
